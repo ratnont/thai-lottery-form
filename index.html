@@ -5,7 +5,7 @@
   <title>Thai Lottery Form</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <link href="https://fonts.googleapis.com/css2?family=TH+Sarabun+New&display=swap" rel="stylesheet" />
-  <script src="https://unpkg.com/html5-qrcode@2.3.10/html5-qrcode.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
   <style>
     body {
       font-family: 'TH Sarabun New', sans-serif;
@@ -119,12 +119,17 @@
     .qr-section {
       max-width: 400px;
     }
-    #qr-reader {
-      width: 100%;
-      max-width: 360px;
-      border-radius: 8px;
-      overflow: hidden;
-      margin-top: 8px;
+    #qr-overlay {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      width: 200px;
+      height: 200px;
+      border: 3px solid #00e676;
+      border-radius: 6px;
+      box-shadow: 0 0 0 9999px rgba(0,0,0,0.45);
+      pointer-events: none;
     }
     #qr-status {
       font-size: 15px;
@@ -132,13 +137,8 @@
       min-height: 22px;
       color: #555;
     }
-    #qr-status.success {
-      color: #28a745;
-      font-weight: bold;
-    }
-    #qr-status.error {
-      color: #dc3545;
-    }
+    #qr-status.success { color: #28a745; font-weight: bold; }
+    #qr-status.error   { color: #dc3545; }
     .bottom-controls {
       text-align: center;
       margin-top: 20px;
@@ -207,7 +207,11 @@
     </select>
     <div class="qr-section">
       <button id="qrToggleBtn" onclick="toggleQRScanner()">เริ่มสแกน QR</button>
-      <div id="qr-reader" style="display:none;"></div>
+      <div id="qr-container" style="display:none; position:relative; max-width:300px; margin-top:8px;">
+        <video id="qr-video" playsinline style="width:100%; border-radius:8px; display:block;"></video>
+        <canvas id="qr-canvas" style="display:none;"></canvas>
+        <div id="qr-overlay"></div>
+      </div>
       <div id="qr-status"></div>
     </div>
     <div>
@@ -229,7 +233,6 @@
     const lotteryOptions = ["None", "รัฐบาล", "การกุศล"];
     let currentTableIndex = 0;
     let tableRowsFilled = Array(6).fill(0);
-    let html5QrCodeInstance = null;
     let ticketMap = new Map(); // ticketCode -> { table, row }
     let entryHistory = [];
 
@@ -364,91 +367,158 @@
     }
 
     let qrScanning = false;
+    let qrStream = null;
+    let qrAnimFrame = null;
+    let lastScannedCode = null;
+    let lastScannedTime = 0;
+    let barcodeDetector = null;
 
-    function toggleQRScanner() {
-      if (qrScanning) {
-        stopQRScanner();
-      } else {
-        startQRScanner();
-      }
-    }
-
-    function startQRScanner() {
-      const qrDiv = document.getElementById("qr-reader");
-      const btn = document.getElementById("qrToggleBtn");
-      const status = document.getElementById("qr-status");
-      qrDiv.innerHTML = "";
-      qrDiv.style.display = "block";
-      status.textContent = "กำลังเปิดกล้อง...";
-      status.className = "";
-
-      if (html5QrCodeInstance) {
-        html5QrCodeInstance.stop().catch(() => {});
-        html5QrCodeInstance.clear().catch(() => {});
-      }
-
-      html5QrCodeInstance = new Html5Qrcode("qr-reader");
-      const config = { fps: 10, qrbox: { width: 250, height: 250 } };
-
-      html5QrCodeInstance.start({ facingMode: "environment" }, config, qrMessage => {
-        if (!qrMessage.includes('-')) return;
-        const parts = qrMessage.split('-');
-        if (parts.length !== 5) return;
-        const cc = parts[2];
-        const dddddd = parts[3];
-        if (!/^\d{2}$/.test(cc) || !/^\d{6}$/.test(dddddd)) return;
-
-        const ticketCode = `${cc}-${dddddd}`;
-        if (ticketMap.has(ticketCode)) return; // toast already handles duplicate
-
-        const prevCount = tableRowsFilled[currentTableIndex];
-        fillTableFromParts(cc, dddddd);
-
-        if (tableRowsFilled[currentTableIndex] > prevCount) {
-          // successful new entry
-          status.textContent = `✓ บันทึกแล้ว: ${ticketCode} (ตารางที่ ${currentTableIndex + 1} แถวที่ ${prevCount + 1})`;
-          status.className = "success";
-
-          // auto-advance to next table if current is full
-          if (tableRowsFilled[currentTableIndex] >= 20) {
-            const next = currentTableIndex + 1;
-            if (next < 6) {
-              setActiveTable(next);
-              document.getElementById('activeTableSelect').value = next;
-              status.textContent += ` — ย้ายไปตารางที่ ${next + 1}`;
-            } else {
-              stopQRScanner();
-              status.textContent = "ครบทุกตารางแล้ว!";
-            }
-          }
-        }
-      }).then(() => {
-        qrScanning = true;
-        btn.textContent = "หยุดสแกน QR";
-        btn.style.backgroundColor = "#dc3545";
-        status.textContent = "พร้อมสแกน — จ่อกล้องที่ QR บนสลาก";
-        status.className = "";
-      }).catch(err => {
-        status.textContent = "ไม่สามารถเปิดกล้องได้: " + err;
-        status.className = "error";
-        qrDiv.style.display = "none";
+    // Prefer native BarcodeDetector (supports Data Matrix on Chrome/Android)
+    // Fall back to jsQR (QR codes only) on unsupported browsers
+    if ('BarcodeDetector' in window) {
+      BarcodeDetector.getSupportedFormats().then(formats => {
+        const wanted = ['data_matrix', 'qr_code', 'aztec'].filter(f => formats.includes(f));
+        barcodeDetector = new BarcodeDetector({ formats: wanted.length ? wanted : ['qr_code'] });
       });
     }
 
-    function stopQRScanner() {
-      const btn = document.getElementById("qrToggleBtn");
-      const status = document.getElementById("qr-status");
-      if (html5QrCodeInstance) {
-        html5QrCodeInstance.stop().then(() => {
-          html5QrCodeInstance.clear().catch(() => {});
-          document.getElementById("qr-reader").style.display = "none";
-        }).catch(() => {});
+    function toggleQRScanner() {
+      qrScanning ? stopQRScanner() : startQRScanner();
+    }
+
+    function startQRScanner() {
+      const btn = document.getElementById('qrToggleBtn');
+      const status = document.getElementById('qr-status');
+      const container = document.getElementById('qr-container');
+      const video = document.getElementById('qr-video');
+
+      status.textContent = 'กำลังเปิดกล้อง...';
+      status.className = '';
+      btn.disabled = true;
+
+      navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: 'environment' } }
+      }).then(stream => {
+        qrStream = stream;
+        video.srcObject = stream;
+        container.style.display = 'block';
+        return video.play();
+      }).then(() => {
+        qrScanning = true;
+        btn.disabled = false;
+        btn.textContent = 'หยุดสแกน QR';
+        btn.style.backgroundColor = '#dc3545';
+        const engine = barcodeDetector ? 'BarcodeDetector' : 'jsQR';
+        status.textContent = `พร้อมสแกน (${engine}) — จ่อกล้องที่บาร์โค้ดบนสลาก`;
+        scanLoop();
+      }).catch(err => {
+        btn.disabled = false;
+        status.textContent = 'ไม่สามารถเปิดกล้องได้: ' + err.message;
+        status.className = 'error';
+      });
+    }
+
+    function scanLoop() {
+      if (!qrScanning) return;
+      const video = document.getElementById('qr-video');
+
+      if (barcodeDetector) {
+        // Native path: handles Data Matrix + QR codes
+        barcodeDetector.detect(video)
+          .then(barcodes => {
+            if (barcodes.length > 0) onRawCode(barcodes[0].rawValue);
+          })
+          .catch(() => {})
+          .finally(() => { if (qrScanning) qrAnimFrame = requestAnimationFrame(scanLoop); });
+      } else {
+        // jsQR fallback: QR codes only
+        const canvas = document.getElementById('qr-canvas');
+        const ctx = canvas.getContext('2d');
+        if (video.readyState === video.HAVE_ENOUGH_DATA) {
+          canvas.width = video.videoWidth;
+          canvas.height = video.videoHeight;
+          ctx.drawImage(video, 0, 0);
+          const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+          const code = jsQR(imageData.data, imageData.width, imageData.height);
+          if (code) onRawCode(code.data);
+        }
+        qrAnimFrame = requestAnimationFrame(scanLoop);
       }
+    }
+
+    function onRawCode(raw) {
+      const now = Date.now();
+      if (raw === lastScannedCode && now - lastScannedTime < 3000) return;
+      lastScannedCode = raw;
+      lastScannedTime = now;
+
+      const status = document.getElementById('qr-status');
+      let cc = null, num = null;
+
+      // Format 1 — original: XXXX-XX-CC-NNNNNN-XX (5 dash parts)
+      const parts = raw.split('-');
+      if (parts.length === 5 && /^\d{2}$/.test(parts[2]) && /^\d{6}$/.test(parts[3])) {
+        cc = parts[2]; num = parts[3];
+      }
+
+      // Format 2 — try any CC-NNNNNN pattern in the string
+      if (!cc) {
+        const m = raw.match(/\b(\d{2})-(\d{6})\b/);
+        if (m) { cc = m[1]; num = m[2]; }
+      }
+
+      // Format 3 — try extracting 2-digit then 6-digit numbers from all digit groups
+      if (!cc) {
+        const digits = raw.match(/\d+/g) || [];
+        const two = digits.find(d => d.length === 2);
+        const six = digits.find(d => d.length === 6);
+        if (two && six) { cc = two; num = six; }
+      }
+
+      if (!cc || !num) {
+        // Show raw content so we can diagnose the real format
+        status.textContent = `พบบาร์โค้ด (ไม่รู้จักรูปแบบ): ${raw}`;
+        status.className = 'error';
+        return;
+      }
+
+      const prevCount = tableRowsFilled[currentTableIndex];
+      fillTableFromParts(cc, num);
+
+      if (tableRowsFilled[currentTableIndex] > prevCount) {
+        status.textContent = `✓ บันทึกแล้ว: ${cc}-${num} (ตารางที่ ${currentTableIndex + 1} แถวที่ ${prevCount + 1})`;
+        status.className = 'success';
+        if (tableRowsFilled[currentTableIndex] >= 20) {
+          const next = currentTableIndex + 1;
+          if (next < 6) {
+            setActiveTable(next);
+            document.getElementById('activeTableSelect').value = next;
+            status.textContent += ` — ย้ายไปตารางที่ ${next + 1}`;
+          } else {
+            stopQRScanner();
+            status.textContent = 'ครบทุกตารางแล้ว!';
+          }
+        }
+      }
+    }
+
+    function stopQRScanner() {
       qrScanning = false;
-      btn.textContent = "เริ่มสแกน QR";
-      btn.style.backgroundColor = "";
-      status.textContent = "";
-      status.className = "";
+      cancelAnimationFrame(qrAnimFrame);
+      qrAnimFrame = null;
+      if (qrStream) {
+        qrStream.getTracks().forEach(t => t.stop());
+        qrStream = null;
+      }
+      const video = document.getElementById('qr-video');
+      video.srcObject = null;
+      document.getElementById('qr-container').style.display = 'none';
+      const btn = document.getElementById('qrToggleBtn');
+      btn.textContent = 'เริ่มสแกน QR';
+      btn.style.backgroundColor = '';
+      const status = document.getElementById('qr-status');
+      status.textContent = '';
+      status.className = '';
     }
 
     function createTables() {
