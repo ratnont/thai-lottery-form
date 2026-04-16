@@ -118,11 +118,57 @@
     }
     .qr-section {
       max-width: 400px;
-      margin: 10px auto;
+    }
+    #qr-reader {
+      width: 100%;
+      max-width: 360px;
+      border-radius: 8px;
+      overflow: hidden;
+      margin-top: 8px;
+    }
+    #qr-status {
+      font-size: 15px;
+      margin-top: 6px;
+      min-height: 22px;
+      color: #555;
+    }
+    #qr-status.success {
+      color: #28a745;
+      font-weight: bold;
+    }
+    #qr-status.error {
+      color: #dc3545;
     }
     .bottom-controls {
       text-align: center;
       margin-top: 20px;
+    }
+    .cell.duplicate {
+      animation: flash-red 1.5s ease-out forwards;
+    }
+    @keyframes flash-red {
+      0%   { background-color: #ff4444; color: white; }
+      60%  { background-color: #ffaaaa; color: black; }
+      100% { background-color: #fff;    color: black; }
+    }
+    #toast {
+      position: fixed;
+      bottom: 30px;
+      left: 50%;
+      transform: translateX(-50%);
+      background: #333;
+      color: #fff;
+      padding: 12px 20px;
+      border-radius: 8px;
+      font-size: 16px;
+      opacity: 0;
+      pointer-events: none;
+      transition: opacity 0.3s;
+      z-index: 9999;
+      white-space: nowrap;
+    }
+    #toast.show {
+      opacity: 1;
     }
     @media print {
       .no-print {
@@ -146,7 +192,10 @@
 <body>
   <div class="controls no-print">
     <label>ชื่อเจ้าของ:</label>
-    <input type="text" id="ownerName" placeholder="ชื่อ นามสกุล" />
+    <input type="text" id="ownerName" placeholder="ชื่อ นามสกุล" list="ownerPresets" />
+    <datalist id="ownerPresets">
+      <option value="รัชนนท์ พงษ์สิทธิถาวร" />
+    </datalist>
     <label>เลือกตารางที่ต้องการกรอก QR:</label>
     <select id="activeTableSelect" onchange="setActiveTable(this.value)">
       <option value="0">ตารางที่ 1</option>
@@ -156,12 +205,11 @@
       <option value="4">ตารางที่ 5</option>
       <option value="5">ตารางที่ 6</option>
     </select>
-	<!--
     <div class="qr-section">
-      <button onclick="startQRScanner()">เริ่มสแกน QR</button>
-      <div id="qr-reader" style="width: 100%; max-width: 360px; height: 360px; display:none; margin-top: 10px;"></div>
+      <button id="qrToggleBtn" onclick="toggleQRScanner()">เริ่มสแกน QR</button>
+      <div id="qr-reader" style="display:none;"></div>
+      <div id="qr-status"></div>
     </div>
-	-->
     <div>
       <label>กรอกเลข:</label>
       <input type="tel" id="manualSet" placeholder="ชุดที่" maxlength="2" style="width:40px;" />
@@ -170,9 +218,11 @@
       <button onclick="undoLastEntry()">ย้อนกลับ</button>
     </div>
   </div>
+  <div id="toast"></div>
   <div class="tables" id="tablesContainer"></div>
   <div class="bottom-controls no-print">
     <button onclick="window.print()">พิมพ์</button>
+    <button onclick="clearState()" style="background-color:#dc3545; margin-left:10px;">ล้างข้อมูลทั้งหมด</button>
   </div>
   <script>
     const prizeOptions = ["None", "ข้างเคียงรางวัลที่ 1", "รางวัลที่ 2", "รางวัลที่ 3", "รางวัลที่ 4", "รางวัลที่ 5", "หน้า 3 ตัว", "ท้าย 3 ตัว", "ท้าย 2 ตัว", "หน้า 3 ตัว+ท้าย 3 ตัว", "หน้า 3 ตัว+ท้าย 2 ตัว", "ท้าย 3 ตัว+ท้าย 2 ตัว"];
@@ -180,7 +230,7 @@
     let currentTableIndex = 0;
     let tableRowsFilled = Array(6).fill(0);
     let html5QrCodeInstance = null;
-    let ticketSet = new Set();
+    let ticketMap = new Map(); // ticketCode -> { table, row }
     let entryHistory = [];
 
     function setActiveTable(index) {
@@ -190,26 +240,47 @@
       });
     }
 
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.textContent = msg;
+      toast.classList.add('show');
+      clearTimeout(toast._hideTimer);
+      toast._hideTimer = setTimeout(() => toast.classList.remove('show'), 3000);
+    }
+
+    function highlightDuplicate(table, row) {
+      for (let c = 0; c < 8; c++) {
+        const cell = document.querySelector(`[data-cell="${table}-${row}-${c}"]`);
+        if (!cell) continue;
+        cell.classList.remove('duplicate');
+        void cell.offsetWidth; // force reflow to restart animation
+        cell.classList.add('duplicate');
+      }
+    }
+
     function fillTableFromParts(cc, dddddd) {
       const ticketCode = `${cc}-${dddddd}`;
-      if (ticketSet.has(ticketCode)) { alert(`หมายเลขนี้ถูกกรอกไปแล้ว: ${ticketCode}`); return; }
+      if (ticketMap.has(ticketCode)) {
+        const { table, row } = ticketMap.get(ticketCode);
+        showToast(`ซ้ำ! ${ticketCode} อยู่ที่ ตารางที่ ${table + 1} แถวที่ ${row + 1}`);
+        setActiveTable(table);
+        document.getElementById('activeTableSelect').value = table;
+        highlightDuplicate(table, row);
+        return;
+      }
       const row = tableRowsFilled[currentTableIndex];
       if (row >= 20) { alert("ตารางนี้ครบแล้ว"); return; }
-      const cells = [];
       for (let i = 0; i < 2; i++) {
-        const cell = document.querySelector(`[data-cell="${currentTableIndex}-${row}-${i}"]`);
-        cell.textContent = cc[i] || '';
-        cells.push(cell);
+        document.querySelector(`[data-cell="${currentTableIndex}-${row}-${i}"]`).textContent = cc[i] || '';
       }
       for (let i = 0; i < 6; i++) {
-        const cell = document.querySelector(`[data-cell="${currentTableIndex}-${row}-${i+2}"]`);
-        cell.textContent = dddddd[i] || '';
-        cells.push(cell);
+        document.querySelector(`[data-cell="${currentTableIndex}-${row}-${i+2}"]`).textContent = dddddd[i] || '';
       }
-      ticketSet.add(ticketCode);
-      entryHistory.push({ table: currentTableIndex, row, ticketCode, cells });
+      ticketMap.set(ticketCode, { table: currentTableIndex, row });
+      entryHistory.push({ table: currentTableIndex, row, ticketCode });
       tableRowsFilled[currentTableIndex]++;
       updateFooter(currentTableIndex);
+      saveState();
     }
 
     function manualInputQR() {
@@ -226,32 +297,159 @@
     function undoLastEntry() {
       const last = entryHistory.pop();
       if (!last) return alert("ยังไม่มีข้อมูลให้ย้อนกลับ");
-      last.cells.forEach(cell => cell.textContent = '');
-      ticketSet.delete(last.ticketCode);
+      for (let c = 0; c < 8; c++) {
+        const cell = document.querySelector(`[data-cell="${last.table}-${last.row}-${c}"]`);
+        if (cell) cell.textContent = '';
+      }
+      ticketMap.delete(last.ticketCode);
       tableRowsFilled[last.table]--;
       updateFooter(last.table);
+      saveState();
     }
 
-	/*
+    function saveState() {
+      const state = {
+        ownerName: document.getElementById('ownerName').value,
+        tableRowsFilled,
+        ticketMap: [...ticketMap.entries()],
+        entryHistory,
+        tables: []
+      };
+      for (let t = 0; t < 6; t++) {
+        const cells = [];
+        for (let row = 0; row < 20; row++) {
+          const rowData = [];
+          for (let c = 0; c < 8; c++) {
+            const cell = document.querySelector(`[data-cell="${t}-${row}-${c}"]`);
+            rowData.push(cell ? cell.textContent : '');
+          }
+          cells.push(rowData);
+        }
+        state.tables.push({
+          lotteryType: document.getElementById(`lottery-${t}`).value,
+          prizeType: document.getElementById(`prize-${t}`).value,
+          cells
+        });
+      }
+      localStorage.setItem('thaiLotteryState', JSON.stringify(state));
+    }
+
+    function loadState() {
+      const raw = localStorage.getItem('thaiLotteryState');
+      if (!raw) return;
+      const state = JSON.parse(raw);
+      document.getElementById('ownerName').value = state.ownerName || '';
+      tableRowsFilled = state.tableRowsFilled || Array(6).fill(0);
+      ticketMap = new Map(state.ticketMap || []);
+      entryHistory = state.entryHistory || [];
+      for (let t = 0; t < 6; t++) {
+        const tableData = state.tables[t];
+        if (!tableData) continue;
+        document.getElementById(`lottery-${t}`).value = tableData.lotteryType || '';
+        document.getElementById(`prize-${t}`).value = tableData.prizeType || '';
+        for (let row = 0; row < 20; row++) {
+          for (let c = 0; c < 8; c++) {
+            const cell = document.querySelector(`[data-cell="${t}-${row}-${c}"]`);
+            if (cell && tableData.cells[row]) cell.textContent = tableData.cells[row][c] || '';
+          }
+        }
+        updateFooter(t);
+      }
+    }
+
+    function clearState() {
+      if (!confirm("ล้างข้อมูลทั้งหมด?")) return;
+      localStorage.removeItem('thaiLotteryState');
+      location.reload();
+    }
+
+    let qrScanning = false;
+
+    function toggleQRScanner() {
+      if (qrScanning) {
+        stopQRScanner();
+      } else {
+        startQRScanner();
+      }
+    }
+
     function startQRScanner() {
       const qrDiv = document.getElementById("qr-reader");
+      const btn = document.getElementById("qrToggleBtn");
+      const status = document.getElementById("qr-status");
       qrDiv.innerHTML = "";
       qrDiv.style.display = "block";
-      qrDiv.style.height = "360px";
+      status.textContent = "กำลังเปิดกล้อง...";
+      status.className = "";
+
       if (html5QrCodeInstance) {
         html5QrCodeInstance.stop().catch(() => {});
         html5QrCodeInstance.clear().catch(() => {});
       }
+
       html5QrCodeInstance = new Html5Qrcode("qr-reader");
       const config = { fps: 10, qrbox: { width: 250, height: 250 } };
+
       html5QrCodeInstance.start({ facingMode: "environment" }, config, qrMessage => {
         if (!qrMessage.includes('-')) return;
         const parts = qrMessage.split('-');
-        if (parts.length !== 5) { alert("QR format invalid"); return; }
-        fillTableFromParts(parts[2], parts[3]);
-        html5QrCodeInstance.stop().then(() => { qrDiv.style.display = "none"; });
-      }).catch(err => alert("ไม่สามารถเปิดกล้องได้: " + err));
-    }*/
+        if (parts.length !== 5) return;
+        const cc = parts[2];
+        const dddddd = parts[3];
+        if (!/^\d{2}$/.test(cc) || !/^\d{6}$/.test(dddddd)) return;
+
+        const ticketCode = `${cc}-${dddddd}`;
+        if (ticketMap.has(ticketCode)) return; // toast already handles duplicate
+
+        const prevCount = tableRowsFilled[currentTableIndex];
+        fillTableFromParts(cc, dddddd);
+
+        if (tableRowsFilled[currentTableIndex] > prevCount) {
+          // successful new entry
+          status.textContent = `✓ บันทึกแล้ว: ${ticketCode} (ตารางที่ ${currentTableIndex + 1} แถวที่ ${prevCount + 1})`;
+          status.className = "success";
+
+          // auto-advance to next table if current is full
+          if (tableRowsFilled[currentTableIndex] >= 20) {
+            const next = currentTableIndex + 1;
+            if (next < 6) {
+              setActiveTable(next);
+              document.getElementById('activeTableSelect').value = next;
+              status.textContent += ` — ย้ายไปตารางที่ ${next + 1}`;
+            } else {
+              stopQRScanner();
+              status.textContent = "ครบทุกตารางแล้ว!";
+            }
+          }
+        }
+      }).then(() => {
+        qrScanning = true;
+        btn.textContent = "หยุดสแกน QR";
+        btn.style.backgroundColor = "#dc3545";
+        status.textContent = "พร้อมสแกน — จ่อกล้องที่ QR บนสลาก";
+        status.className = "";
+      }).catch(err => {
+        status.textContent = "ไม่สามารถเปิดกล้องได้: " + err;
+        status.className = "error";
+        qrDiv.style.display = "none";
+      });
+    }
+
+    function stopQRScanner() {
+      const btn = document.getElementById("qrToggleBtn");
+      const status = document.getElementById("qr-status");
+      if (html5QrCodeInstance) {
+        html5QrCodeInstance.stop().then(() => {
+          html5QrCodeInstance.clear().catch(() => {});
+          document.getElementById("qr-reader").style.display = "none";
+        }).catch(() => {});
+      }
+      qrScanning = false;
+      btn.textContent = "เริ่มสแกน QR";
+      btn.style.backgroundColor = "";
+      status.textContent = "";
+      status.className = "";
+    }
 
     function createTables() {
       const container = document.getElementById('tablesContainer');
@@ -314,8 +512,8 @@
         footerCenter.className = 'footer-center';
         footerCenter.innerHTML = `ชื่อ <span id="owner-${t}"></span>`;
 
-        prizeSelect.onchange = () => updateFooter(t);
-        lotterySelect.onchange = () => updateFooter(t);
+        prizeSelect.onchange = () => { updateFooter(t); saveState(); };
+        lotterySelect.onchange = () => { updateFooter(t); saveState(); };
 
         wrapper.appendChild(grid);
         wrapper.appendChild(lotterySelect);
@@ -343,11 +541,12 @@
 
     document.addEventListener('DOMContentLoaded', () => {
       createTables();
-      // Always update footer once at load to ensure totals show even without name
+      loadState();
       for (let i = 0; i < 6; i++) updateFooter(i);
 
       document.getElementById('ownerName').addEventListener('input', () => {
         for (let i = 0; i < 6; i++) updateFooter(i);
+        saveState();
       });
 
       document.getElementById("manualNumber").addEventListener("keydown", e => {
