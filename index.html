@@ -489,15 +489,7 @@
         status.textContent = `✓ บันทึกแล้ว: ${cc}-${num} (ตารางที่ ${currentTableIndex + 1} แถวที่ ${prevCount + 1})`;
         status.className = 'success';
         if (tableRowsFilled[currentTableIndex] >= 20) {
-          const next = currentTableIndex + 1;
-          if (next < 6) {
-            setActiveTable(next);
-            document.getElementById('activeTableSelect').value = next;
-            status.textContent += ` — ย้ายไปตารางที่ ${next + 1}`;
-          } else {
-            stopQRScanner();
-            status.textContent = 'ครบทุกตารางแล้ว!';
-          }
+          status.textContent = `ตารางที่ ${currentTableIndex + 1} ครบ 20 ชุดแล้ว`;
         }
       }
     }
